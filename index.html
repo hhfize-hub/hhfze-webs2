@@ -422,6 +422,11 @@
   <!-- ===================================================================== -->
   <!-- MODULAR APPLICATION ARCHITECTURE (BUNDLED FOR SINGLE-FILE PREVIEW)    -->
   <!-- ===================================================================== -->
+  <!-- Shared modal host required by all Add/Edit forms -->
+  <div id="modal-root" class="hidden fixed inset-0 z-[100] items-center justify-center bg-black/70 backdrop-blur-sm p-3 sm:p-5" role="dialog" aria-modal="true" onclick="if(event.target===this) App.closeModal()">
+    <div id="modal-card" class="w-full max-w-xl max-h-[90vh] overflow-y-auto rounded-2xl border border-white/10 bg-slateDark shadow-2xl p-4 sm:p-5" onclick="event.stopPropagation()"></div>
+  </div>
+
   <script type="module">
     import { initializeApp } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js';
     import {
@@ -444,7 +449,8 @@
       getStorage,
       ref as storageRef,
       uploadBytes,
-      getDownloadURL
+      getDownloadURL,
+      deleteObject
     } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-storage.js';
 
     // =========================================================================
@@ -923,49 +929,7 @@
       { id: 'quick_notes', titleKey: 'quickNote', visible: true, span: 'col-span-12 md:col-span-6 xl:col-span-4' }
     ];
 
-    const BUILTIN_TRACKS = [
-      {
-        id: 'builtin_1',
-        title: 'Deep Focus Synth (432Hz)',
-        artist: 'MY DAILY Ambient Engine',
-        category: 'Focus',
-        duration: 180,
-        synthFreq: 144,
-        coverGradient: 'from-blue-600 to-indigo-700',
-        isBuiltin: true
-      },
-      {
-        id: 'builtin_2',
-        title: 'Midnight Flow Binaural',
-        artist: 'MY DAILY Neural Audio',
-        category: 'Deep Work',
-        duration: 240,
-        synthFreq: 174,
-        coverGradient: 'from-purple-600 to-fuchsia-700',
-        isBuiltin: true
-      },
-      {
-        id: 'builtin_3',
-        title: 'Ethereal Horizon Pad',
-        artist: 'MY DAILY Soundscapes',
-        category: 'Calm',
-        duration: 210,
-        synthFreq: 216,
-        coverGradient: 'from-cyan-600 to-blue-700',
-        isBuiltin: true
-      },
-      {
-        id: 'builtin_4',
-        title: 'Quantum Momentum Pulse',
-        artist: 'MY DAILY Studio',
-        category: 'Energy',
-        duration: 195,
-        synthFreq: 256,
-        coverGradient: 'from-violet-600 to-purple-800',
-        isBuiltin: true
-      }
-    ];
-
+    const BUILTIN_TRACKS = [];
     // =========================================================================
     // MODULE 3: INDEXEDDB LOCAL STORAGE SERVICE (services/storage.js)
     // =========================================================================
@@ -1228,23 +1192,33 @@
           'tasks', 'habits', 'habitLogs', 'routines', 'routineLogs',
           'goals', 'schedule', 'events', 'focusSessions', 'notes',
           'playlists', 'musicMeta', 'gpsActivities', 'wheels', 'wheelHistory',
-          'weeklyReviews', 'aiChats', 'settings', 'widgets', 'visionBoard', 'finance', 'qrHistory'
+          'weeklyReviews', 'aiChats', 'settings', 'widgets', 'visionBoard', 'finance', 'qrHistory', 'customAudioTracks'
         ];
 
         try {
           for (const key of keys) {
             const ref = this.getUserDocRef(key);
             const snap = await getDoc(ref);
-            const localData = Store.data[key];
+            const localData = key === 'customAudioTracks'
+              ? ((await LocalDB.getState('customAudioTracks')) || [])
+              : Store.data[key];
 
             if (!snap.exists()) {
-              await setDoc(ref, { items: localData, updatedAt: Date.now(), uid: this.user.uid });
+              let initialCloudData = localData;
+              if (key === 'visionBoard' && Array.isArray(localData)) initialCloudData = localData.map(({ image, ...card }) => ({ ...card, cloudUrl: card.cloudUrl || '', image: '' }));
+              await setDoc(ref, { items: initialCloudData, updatedAt: Date.now(), uid: this.user.uid });
             } else {
               const cloudData = snap.data().items;
               const merged = this.mergeCollections(localData, cloudData);
-              Store.data[key] = merged;
-              await LocalDB.setState(key, merged);
-              await setDoc(ref, { items: merged, updatedAt: Date.now(), uid: this.user.uid });
+              if (key === 'visionBoard' && Array.isArray(merged)) merged.forEach(card => { if (!card.image) card.image = (localData || []).find(x => x.id === card.id)?.image || card.cloudUrl || ''; });
+              if (key === 'customAudioTracks') await LocalDB.setState('customAudioTracks', merged);
+              else { Store.data[key] = merged; await LocalDB.setState(key, merged); }
+              if (key === 'customAudioTracks') {
+                try { MusicEngine.tracks = [...BUILTIN_TRACKS, ...merged, ...MusicEngine.offlineTracks.filter(o => !merged.some(t => t.id === o.id))]; } catch {}
+              }
+              let cloudMerged = merged;
+              if (key === 'visionBoard' && Array.isArray(merged)) cloudMerged = merged.map(({ image, ...card }) => ({ ...card, cloudUrl: card.cloudUrl || '', image: '' }));
+              await setDoc(ref, { items: cloudMerged, updatedAt: Date.now(), uid: this.user.uid });
             }
 
             const unsub = onSnapshot(
@@ -1252,7 +1226,21 @@
               async (docSnap) => {
                 if (docSnap.exists() && !docSnap.metadata.hasPendingWrites) {
                   const remoteItems = docSnap.data().items;
-                  if (JSON.stringify(remoteItems) !== JSON.stringify(Store.data[key])) {
+                  if (key === 'customAudioTracks') {
+                    const localTracks = (await LocalDB.getState('customAudioTracks')) || [];
+                    const mergedTracks = this.mergeCollections(localTracks, remoteItems || []);
+                    await LocalDB.setState('customAudioTracks', mergedTracks);
+                    MusicEngine.tracks = [...BUILTIN_TRACKS, ...mergedTracks, ...MusicEngine.offlineTracks.filter(o => !mergedTracks.some(t => t.id === o.id))];
+                    App.renderCurrentView();
+                  } else if (key === 'visionBoard') {
+                    const localCards = Store.data.visionBoard || [];
+                    const mergedCards = (remoteItems || []).map(card => ({ ...card, image: card.image || localCards.find(x => x.id === card.id)?.image || card.cloudUrl || '' }));
+                    if (JSON.stringify(mergedCards) !== JSON.stringify(Store.data.visionBoard)) {
+                      Store.data.visionBoard = mergedCards;
+                      await LocalDB.setState('visionBoard', mergedCards);
+                      App.renderCurrentView();
+                    }
+                  } else if (JSON.stringify(remoteItems) !== JSON.stringify(Store.data[key])) {
                     Store.data[key] = remoteItems;
                     await LocalDB.setState(key, remoteItems);
                     App.applyTheme();
@@ -1302,25 +1290,55 @@
       },
 
       async saveKey(key, value) {
-        await LocalDB.setState(key, value);
-        if (this.isGoogleUser && this.db && this.user) {
-          try {
-            this.setStatus('syncing');
-            await setDoc(this.getUserDocRef(key), { items: value, updatedAt: Date.now(), uid: this.user.uid });
-            this.setStatus('synced');
-          } catch {
-            this.setStatus(navigator.onLine ? 'error' : 'offline');
-          }
-        } else {
+        const localSaved = await LocalDB.setState(key, value);
+        if (localSaved === false) throw new Error('Gagal menyimpan data lokal: ' + key);
+        if (!this.isGoogleUser || !this.db || !this.user) {
           this.setStatus(navigator.onLine ? 'local' : 'offline');
+          return { local: true, cloud: false };
+        }
+        this.setStatus('syncing');
+        try {
+          let cloudValue = value;
+          if (key === 'visionBoard' && Array.isArray(value)) {
+            cloudValue = value.map(({ image, ...card }) => ({ ...card, cloudUrl: card.cloudUrl || '', image: '' }));
+          }
+          await setDoc(this.getUserDocRef(key), { items: cloudValue, updatedAt: Date.now(), uid: this.user.uid });
+          this.setStatus('synced');
+          return { local: true, cloud: true };
+        } catch (err) {
+          this.setStatus(navigator.onLine ? 'error' : 'offline');
+          throw err;
         }
       },
 
       async pushAllToCloud() {
-        if (!this.isGoogleUser) return;
-        for (const key of Object.keys(Store.data)) {
-          await this.saveKey(key, Store.data[key]);
+        if (!this.isGoogleUser || !this.db || !this.user) {
+          App.toast('Login Google terlebih dahulu untuk sinkronisasi cloud.', 'info');
+          return false;
         }
+        this.setStatus('syncing');
+        const keys = [...Object.keys(Store.data), 'customAudioTracks'];
+        const uniqueKeys = [...new Set(keys)];
+        const errors = [];
+        for (const key of uniqueKeys) {
+          const value = key === 'customAudioTracks'
+            ? ((await LocalDB.getState('customAudioTracks')) || [])
+            : Store.data[key];
+          try {
+            await this.saveKey(key, value);
+          } catch (err) {
+            errors.push(`${key}: ${err?.message || err}`);
+          }
+        }
+        if (errors.length) {
+          this.setStatus('error');
+          App.toast(`Sinkronisasi gagal untuk ${errors.length} data. ${errors.slice(0, 2).join(' | ')}`, 'error');
+          console.error('Cloud sync failed:', errors);
+          return false;
+        }
+        this.setStatus('synced');
+        App.toast('Sinkronisasi berhasil. Data sudah dikirim ke cloud.', 'success');
+        return true;
       }
     };
 
@@ -1664,33 +1682,8 @@
     };
 
  // =========================================================================
-    // MODULE 6: MUSIC ENGINE (YOUTUBE / PIPED SEARCH + OFFLINE DOWNLOADS + UPLOAD)
+    // MODULE 6: MUSIC ENGINE (GLOBAL ITUNES SEARCH + OFFLINE DOWNLOADS + UPLOAD)
     // =========================================================================
-    // YouTube Data API v3 key: isi jika ingin pencarian YouTube aktif.
-    const MY_DAILY_YOUTUBE_API_KEY = 'AIzaSyC1g14ZqmP-Y5_i1P6To91JOneqrLItLFo';
-    // Official YouTube IFrame Player API loader (full playback inside the app page).
-    const YouTubePlayerAPI = {
-      player: null, ready: false, loading: null,
-      load() {
-        if (this.ready && window.YT && window.YT.Player) return Promise.resolve();
-        if (this.loading) return this.loading;
-        this.loading = new Promise((resolve, reject) => {
-          const prior = window.onYouTubeIframeAPIReady;
-          window.onYouTubeIframeAPIReady = () => {
-            if (typeof prior === 'function') prior();
-            this.ready = true; resolve();
-          };
-          if (!document.querySelector('script[src="https://www.youtube.com/iframe_api"]')) {
-            const script = document.createElement('script');
-            script.src = 'https://www.youtube.com/iframe_api';
-            script.onerror = () => reject(new Error('YouTube Player API gagal dimuat'));
-            document.head.appendChild(script);
-          } else if (window.YT && window.YT.Player) { this.ready = true; resolve(); }
-        });
-        return this.loading;
-      }
-    };
-
     const MusicEngine = {
       tracks: [...BUILTIN_TRACKS],
       offlineTracks: [],
@@ -1709,8 +1702,6 @@
       audioCtx: null,
       oscillator: null,
       gainNode: null,
-      youtubeTrackId: null,
-      youtubeReadyPromise: null,
 
       async init() {
         const customTracks = await LocalDB.getState('customAudioTracks');
@@ -1770,75 +1761,78 @@
         if (index !== undefined) this.currentIndex = index;
         const track = this.getCurrentTrack();
         if (!track) return;
-        this.stopSynth(); this.audioEl.pause(); clearInterval(this.interval);
-        this.isPlaying = false;
-        this.progressSec = 0;
 
-        if (track.source === 'youtube' && track.videoId) {
-          try {
-            if (!navigator.onLine) { App.toast('YouTube playback memerlukan internet.', 'error'); return; }
-            await YouTubePlayerAPI.load();
-            const mount = document.getElementById('youtube-player-mount');
-            if (!mount) { App.toast('Player YouTube belum tersedia. Buka halaman Music lagi.', 'error'); return; }
-            mount.classList.remove('hidden');
-            document.getElementById('youtube-player-shell')?.classList.remove('hidden');
-            document.getElementById('music-artwork')?.classList.add('hidden');
-            if (!YouTubePlayerAPI.player) {
-              YouTubePlayerAPI.player = new YT.Player('youtube-player-mount', {
-                width: '100%', height: '100%', videoId: track.videoId,
-                playerVars: { autoplay: 1, controls: 1, playsinline: 1, rel: 0 },
-                events: {
-                  onReady: (event) => { event.target.playVideo(); this.isPlaying = true; this.updateUI(); },
-                  onStateChange: (event) => {
-                    if (event.data === YT.PlayerState.PLAYING) { this.isPlaying = true; clearInterval(this.interval); this.interval = setInterval(() => { try { this.progressSec = Math.floor(YouTubePlayerAPI.player.getCurrentTime() || 0); this.updateProgressUI(); } catch {} }, 500); }
-                    if (event.data === YT.PlayerState.PAUSED) { this.isPlaying = false; clearInterval(this.interval); this.updateUI(); }
-                    if (event.data === YT.PlayerState.ENDED) { this.isPlaying = false; clearInterval(this.interval); this.next(); }
-                  },
-                  onError: () => { this.isPlaying = false; App.toast('Video tidak dapat diputar di player YouTube.', 'error'); this.updateUI(); }
-                }
-              });
-            } else {
-              YouTubePlayerAPI.player.loadVideoById(track.videoId);
-              this.isPlaying = true;
+        this.stopSynth();
+        this.audioEl.pause();
+        clearInterval(this.interval);
+
+        if (track.isBuiltin) {
+          this.startSynth(track.synthFreq || 144);
+          this.isPlaying = true;
+          this.interval = setInterval(() => {
+            if (!this.isPlaying) return;
+            this.progressSec++;
+            if (this.progressSec >= track.duration) {
+              this.progressSec = 0;
+              this.next();
             }
-          } catch (err) { App.toast('Gagal memulai YouTube Player: ' + err.message, 'error'); return; }
-        } else if (track.isBuiltin) {
-          const shell = document.getElementById('youtube-player-shell'); if (shell) shell.classList.add('hidden');
-          document.getElementById('music-artwork')?.classList.remove('hidden');
-          const mount = document.getElementById('youtube-player-mount'); if (mount) mount.classList.add('hidden');
-          this.startSynth(track.synthFreq || 144); this.isPlaying = true;
-          this.interval = setInterval(() => { if (!this.isPlaying) return; this.progressSec++; if (this.progressSec >= track.duration) { this.progressSec = 0; this.next(); } this.updateProgressUI(); }, 1000);
+            this.updateProgressUI();
+          }, 1000);
         } else {
-          const shell = document.getElementById('youtube-player-shell'); if (shell) shell.classList.add('hidden');
-          document.getElementById('music-artwork')?.classList.remove('hidden');
-          const mount = document.getElementById('youtube-player-mount'); if (mount) mount.classList.add('hidden');
+          // 1. Check Offline IndexedDB store first
           const offlineAll = await LocalDB.getAllOfflineSongs();
-          const offlineHit = offlineAll.find(o => o.id === track.id);
-          if (offlineHit && offlineHit.blob) { this.audioEl.src = URL.createObjectURL(offlineHit.blob); await this.audioEl.play(); this.isPlaying = true; }
-          else {
+          const offlineHit = offlineAll.find((o) => o.id === track.id);
+
+          if (offlineHit && offlineHit.blob) {
+            this.audioEl.src = URL.createObjectURL(offlineHit.blob);
+            await this.audioEl.play();
+            this.isPlaying = true;
+          } else {
+            // 2. Check Uploaded local audio blobs
             const blobRecord = await LocalDB.getAudioBlob(track.id);
-            if (blobRecord && blobRecord.blob) { this.audioEl.src = URL.createObjectURL(blobRecord.blob); await this.audioEl.play(); this.isPlaying = true; }
-            else if (track.previewUrl || track.cloudUrl) { if (!navigator.onLine) { App.toast('Offline: unduh audio yang legal saat online untuk diputar offline.', 'error'); return; } this.audioEl.src = track.previewUrl || track.cloudUrl; await this.audioEl.play(); this.isPlaying = true; }
-            else { App.toast('Audio source unavailable offline.', 'error'); return; }
+            if (blobRecord && blobRecord.blob) {
+              this.audioEl.src = URL.createObjectURL(blobRecord.blob);
+              await this.audioEl.play();
+              this.isPlaying = true;
+            } else if (track.previewUrl || track.cloudUrl) {
+              // 3. Stream online preview URL
+              if (!navigator.onLine) {
+                App.toast('Offline: Download this song while online to play offline.', 'error');
+                return;
+              }
+              this.audioEl.src = track.previewUrl || track.cloudUrl;
+              await this.audioEl.play();
+              this.isPlaying = true;
+            } else {
+              App.toast('Audio source unavailable offline.', 'error');
+              return;
+            }
           }
-          this.interval = setInterval(() => { this.progressSec = Math.floor(this.audioEl.currentTime || 0); this.updateProgressUI(); }, 500);
+
+          this.interval = setInterval(() => {
+            this.progressSec = Math.floor(this.audioEl.currentTime || 0);
+            this.updateProgressUI();
+          }, 500);
         }
-        const rec = Store.data.musicMeta?.recentlyPlayed || [];
-        Store.data.musicMeta.recentlyPlayed = [track.id, ...rec.filter(id => id !== track.id)].slice(0, 12);
-        Store.save('musicMeta'); this.updateUI();
-        if (App.currentView === 'music' && track.source !== 'youtube') App.renderCurrentView();
+
+        const rec = Store.data.musicMeta.recentlyPlayed || [];
+        Store.data.musicMeta.recentlyPlayed = [track.id, ...rec.filter((id) => id !== track.id)].slice(0, 12);
+        Store.save('musicMeta');
+        this.updateUI();
+        if (App.currentView === 'music') App.renderCurrentView();
       },
 
       togglePlay() {
-        const track = this.getCurrentTrack();
-        if (track?.source === 'youtube' && YouTubePlayerAPI.player) {
-          const state = YouTubePlayerAPI.player.getPlayerState();
-          if (state === YT.PlayerState.PLAYING) YouTubePlayerAPI.player.pauseVideo(); else YouTubePlayerAPI.player.playVideo();
-          this.isPlaying = state !== YT.PlayerState.PLAYING; this.updateUI();
-          if (App.currentView === 'music') App.renderCurrentView(); return;
+        if (this.isPlaying) {
+          this.isPlaying = false;
+          this.stopSynth();
+          this.audioEl.pause();
+          clearInterval(this.interval);
+          this.updateUI();
+          if (App.currentView === 'music') App.renderCurrentView();
+        } else {
+          this.playTrack(this.currentIndex);
         }
-        if (this.isPlaying) { this.isPlaying = false; this.stopSynth(); this.audioEl.pause(); clearInterval(this.interval); this.updateUI(); if (App.currentView === 'music') App.renderCurrentView(); }
-        else this.playTrack(this.currentIndex);
       },
 
       next() {
@@ -1860,11 +1854,12 @@
       seek(pct) {
         const track = this.getCurrentTrack();
         if (!track) return;
-        const dur = track.isBuiltin ? track.duration : (track.source === 'youtube' ? (YouTubePlayerAPI.player?.getDuration?.() || track.duration || 0) : (this.audioEl.duration || track.duration || 0));
+        const dur = track.isBuiltin ? track.duration : (this.audioEl.duration || track.duration || 0);
         const target = Math.floor((pct / 100) * dur);
         this.progressSec = target;
-        if (track.source === 'youtube' && YouTubePlayerAPI.player) YouTubePlayerAPI.player.seekTo(target, true);
-        else if (!track.isBuiltin && this.audioEl.src) this.audioEl.currentTime = target;
+        if (!track.isBuiltin && this.audioEl.src) {
+          this.audioEl.currentTime = target;
+        }
         this.updateProgressUI();
       },
 
@@ -1878,70 +1873,90 @@
         Store.save('musicMeta');
       },
 
-      // Internet Archive public audio catalog
-      async searchInternetArchive(query){
-        this.archiveQuery=(query||'').trim();
-        if(!this.archiveQuery)return;
-        this.archiveSearchResults=[];
-        App.renderCurrentView();
-        try{
-          const q=encodeURIComponent(`(${this.archiveQuery}) AND mediatype:audio AND licenseurl:http*creativecommons.org*`);
-          const url=`https://archive.org/advancedsearch.php?q=${q}&fl[]=identifier&fl[]=title&fl[]=creator&fl[]=licenseurl&fl[]=rights&rows=12&page=1&output=json`;
-          const res=await fetch(url);
-          if(!res.ok)throw new Error('Catalog unavailable');
-          const data=await res.json();
-          const items=data.response?.docs||[];
-          const resolved=await Promise.all(items.slice(0,8).map(async item=>{
-            try{
-              const m=await fetch(`https://archive.org/metadata/${encodeURIComponent(item.identifier)}`).then(x=>x.json());
-              const files=(m.files||[]).filter(f=>/^(mp3|ogg|flac|wav)$/i.test(f.format||'')&&!f.name.includes('_meta')&&!f.name.endsWith('.xml')).sort((a,b)=>{const ap=/mp3/i.test(a.format)?0:1,bp=/mp3/i.test(b.format)?0:1;return ap-bp;});
-              const file=files[0];
-              if(!file)return null;
-              const lic=item.licenseurl||m.metadata?.licenseurl||m.metadata?.rights||item.rights||'Rights not specified';
-              return {identifier:item.identifier,title:item.title||m.metadata?.title||item.identifier,creator:item.creator||m.metadata?.creator||'Unknown creator',license:String(lic).slice(0,140),page:`https://archive.org/details/${item.identifier}`,url:`https://archive.org/download/${item.identifier}/${encodeURIComponent(file.name).replace(/%2F/g,'/')}`,duration:Number(file.duration||0)}
-            }catch{return null;}
-          }));
-          this.archiveSearchResults=resolved.filter(Boolean);
-        }catch(e){
-          App.toast('Internet Archive search failed.','error');
-        }
-        App.renderCurrentView();
-      },
+      // Internet Archive public audio catalog (license/rights are displayed; review item rights before reuse).
+      async searchInternetArchive(query){this.archiveQuery=(query||'').trim();if(!this.archiveQuery)return;this.archiveSearchResults=[];App.renderCurrentView();try{const q=encodeURIComponent(`(${this.archiveQuery}) AND mediatype:audio AND licenseurl:http*creativecommons.org*`);const url=`https://archive.org/advancedsearch.php?q=${q}&fl[]=identifier&fl[]=title&fl[]=creator&fl[]=licenseurl&fl[]=rights&rows=12&page=1&output=json`;const res=await fetch(url);if(!res.ok)throw new Error('Catalog unavailable');const data=await res.json();const items=data.response?.docs||[];const resolved=await Promise.all(items.slice(0,8).map(async item=>{try{const m=await fetch(`https://archive.org/metadata/${encodeURIComponent(item.identifier)}`).then(x=>x.json());const files=(m.files||[]).filter(f=>/^(mp3|ogg|flac|wav)$/i.test(f.format||'')&&!f.name.includes('_meta')&&!f.name.endsWith('.xml')).sort((a,b)=>{const ap=/mp3/i.test(a.format)?0:1,bp=/mp3/i.test(b.format)?0:1;return ap-bp;});const file=files[0];if(!file)return null;const lic=item.licenseurl||m.metadata?.licenseurl||m.metadata?.rights||item.rights||'Rights not specified';return {identifier:item.identifier,title:item.title||m.metadata?.title||item.identifier,creator:item.creator||m.metadata?.creator||'Unknown creator',license:String(lic).slice(0,140),page:`https://archive.org/details/${item.identifier}`,url:`https://archive.org/download/${item.identifier}/${encodeURIComponent(file.name).replace(/%2F/g,'/')}`,duration:Number(file.length||0)}}catch{return null;}}));this.archiveSearchResults=resolved.filter(Boolean);}catch(e){App.toast('Internet Archive search failed.','error');}App.renderCurrentView();},
+      async playArchiveItem(index){const r=this.archiveSearchResults[index];if(!r)return;const track={id:'ia_'+r.identifier,title:r.title,artist:r.creator,album:'Internet Archive',category:'Open catalog',duration:r.duration||0,previewUrl:r.url,artworkUrl:'',coverGradient:'from-blue-600 to-purple-700',isBuiltin:false,cloudUrl:r.url,license:r.license,sourcePage:r.page};await this.playExternalOrOfflineTrack(track);this.tracks[this.currentIndex].sourcePage=r.page;},
 
-      async playArchiveItem(index){
-        const r=this.archiveSearchResults[index];
-        if(!r)return;
-        const track={id:'ia_'+r.identifier,title:r.title,artist:r.creator,album:'Internet Archive',category:'Open catalog',duration:r.duration||0,previewUrl:r.url,artworkUrl:'',coverGradient:'from-blue-600 to-purple-700',isBuiltin:false,cloudUrl:r.url,license:r.license,sourcePage:r.page};
-        await this.playExternalOrOfflineTrack(track);
-        this.tracks[this.currentIndex].sourcePage=r.page;
-      },
-
-      // YouTube Music Search & Stream Integration (Full Duration)
+      // Legitimate Public iTunes Search API (official 30s audio previews & metadata)
+      // Global Music Search: use iTunes JSONP to avoid browser CORS fetch failures.
+      // This changes only catalog search; player, upload, playlists and offline storage remain untouched.
       async searchGlobalMusic(query) {
-        this.searchQuery = (query || '').trim(); if (!this.searchQuery) return;
-        if (!navigator.onLine) { App.toast('Anda sedang offline.', 'error'); return; }
-        if (!MY_DAILY_YOUTUBE_API_KEY || MY_DAILY_YOUTUBE_API_KEY === 'YOUR_YOUTUBE_API_KEY') { App.toast('Isi MY_DAILY_YOUTUBE_API_KEY di file HTML dengan API key YouTube Data API v3 agar pencarian aktif.', 'error'); return; }
-        this.isSearching = true; App.renderCurrentView();
+        this.searchQuery = String(query || '').trim();
+        if (!this.searchQuery) return;
+        if (!navigator.onLine) {
+          App.toast('You are offline. Switch to Downloaded / Offline tab.', 'error');
+          return;
+        }
+
+        this.isSearching = true;
+        this.searchResults = [];
+        App.renderCurrentView();
+
+        let script = null;
+        let callbackName = null;
+        let timeoutId = null;
+
         try {
-          const params = new URLSearchParams({ part:'snippet', type:'video', videoCategoryId:'10', maxResults:'12', q:this.searchQuery, key:MY_DAILY_YOUTUBE_API_KEY });
-          const res = await fetch(`https://www.googleapis.com/youtube/v3/search?${params}`);
-          if (!res.ok) { const info=await res.json().catch(()=>({})); throw new Error(info.error?.message || 'YouTube API error'); }
-          const data = await res.json();
-          this.searchResults = (data.items || []).filter(i=>i.id?.videoId).map(i=>({
-            id:'yt_'+i.id.videoId, videoId:i.id.videoId, source:'youtube', title:i.snippet.title,
-            artist:i.snippet.channelTitle||'YouTube', album:'YouTube', category:'Global', duration:0,
-            previewUrl:'', cloudUrl:`https://www.youtube.com/watch?v=${i.id.videoId}`,
-            artworkUrl:i.snippet.thumbnails?.high?.url||i.snippet.thumbnails?.medium?.url||i.snippet.thumbnails?.default?.url||'',
-            coverGradient:'from-red-600 to-rose-700', isBuiltin:false
-          }));
-        } catch(err) { console.error('YouTube API search error',err); App.toast('Pencarian YouTube gagal: '+err.message,'error'); this.searchResults=[]; }
-        finally { this.isSearching=false; App.renderCurrentView(); }
+          const data = await new Promise((resolve, reject) => {
+            callbackName = `__myDailyItunes_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+            const params = new URLSearchParams({
+              term: this.searchQuery,
+              media: 'music',
+              entity: 'song',
+              limit: '25',
+              callback: callbackName
+            });
+            script = document.createElement('script');
+            script.async = true;
+            script.src = `https://itunes.apple.com/search?${params.toString()}`;
+            window[callbackName] = (payload) => {
+              clearTimeout(timeoutId);
+              resolve(payload);
+            };
+            script.onerror = () => {
+              clearTimeout(timeoutId);
+              reject(new Error('iTunes catalog script could not load. Check connection or try again.'));
+            };
+            timeoutId = setTimeout(() => {
+              reject(new Error('Search timed out. Please try again.'));
+            }, 15000);
+            document.head.appendChild(script);
+          });
+
+          this.searchResults = (data?.results || [])
+            .filter((item) => item.previewUrl && item.trackId)
+            .map((item) => ({
+              id: 'itunes_' + item.trackId,
+              title: item.trackName || 'Untitled',
+              artist: item.artistName || 'Unknown artist',
+              album: item.collectionName || '',
+              category: item.primaryGenreName || 'Global',
+              duration: Math.round((item.trackTimeMillis || 30000) / 1000),
+              previewUrl: item.previewUrl,
+              artworkUrl: (item.artworkUrl100 || '').replace('100x100', '300x300'),
+              coverGradient: 'from-blue-600 to-purple-700',
+              isBuiltin: false
+            }));
+          if (!this.searchResults.length) App.toast('No tracks with playable previews were found.', 'info');
+        } catch (err) {
+          console.error('Global music search failed:', err);
+          App.toast('Global music search failed: ' + (err?.message || 'Unknown error'), 'error');
+          this.searchResults = [];
+        } finally {
+          if (timeoutId) clearTimeout(timeoutId);
+          if (script?.parentNode) script.parentNode.removeChild(script);
+          if (callbackName && window[callbackName]) {
+            try { delete window[callbackName]; } catch { window[callbackName] = undefined; }
+          }
+          this.isSearching = false;
+          App.renderCurrentView();
+        }
       },
 
-      // Genuine Offline Audio Blob Download (Full Duration)
+      // Genuine Offline Audio Blob Download into IndexedDB
       async downloadForOffline(trackId) {
         const song = this.searchResults.find((s) => s.id === trackId);
-        if (!song || song.source === 'youtube' || !song.previewUrl || this.downloadingIds.has(trackId)) { if (song?.source === 'youtube') App.toast('Unduhan YouTube tidak tersedia. Gunakan sumber audio yang memiliki izin unduh.', 'info'); return; }
+        if (!song || !song.previewUrl || this.downloadingIds.has(trackId)) return;
 
         this.downloadingIds.add(trackId);
         App.renderCurrentView();
@@ -1952,7 +1967,7 @@
           const blob = await response.blob();
           const savedMeta = {
             ...song,
-            duration: song.duration,
+            duration: 30,
             isOfflineSaved: true
           };
           await LocalDB.saveOfflineSong(savedMeta, blob);
@@ -1960,9 +1975,9 @@
           if (!this.tracks.some((t) => t.id === song.id)) {
             this.tracks.push(savedMeta);
           }
-          App.toast(`Berhasil mengunduh "${song.title}" full durasi untuk offline!`, 'success');
+          App.toast(`Downloaded "${song.title}" for offline playback!`, 'success');
         } catch (err) {
-          App.toast('Gagal mengunduh audio: ' + err.message, 'error');
+          App.toast('Offline download failed: ' + err.message, 'error');
         } finally {
           this.downloadingIds.delete(trackId);
           App.renderCurrentView();
@@ -1983,12 +1998,14 @@
           if (!file.type.startsWith('audio/')) continue;
           const id = 'audio_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
           let cloudUrl = '';
+          let cloudPath = '';
           if (CloudSync.isGoogleUser && CloudSync.storage && CloudSync.user) {
             try {
-              const sRef = storageRef(CloudSync.storage, `users/${CloudSync.user.uid}/music/${id}_${file.name}`);
+              cloudPath = `users/${CloudSync.user.uid}/music/${id}_${file.name}`;
+              const sRef = storageRef(CloudSync.storage, cloudPath);
               await uploadBytes(sRef, file);
               cloudUrl = await getDownloadURL(sRef);
-            } catch {}
+            } catch (storageErr) { cloudPath = ''; console.warn('Audio cloud upload failed; local file retained.', storageErr); }
           }
           const trackObj = {
             id,
@@ -1998,15 +2015,37 @@
             duration: 180,
             coverGradient: 'from-emerald-600 to-teal-700',
             isBuiltin: false,
-            cloudUrl
+            cloudUrl,
+            cloudPath
           };
           await LocalDB.saveAudioBlob(id, file, trackObj);
           customTracks.push(trackObj);
           this.tracks.push(trackObj);
         }
         await LocalDB.setState('customAudioTracks', customTracks);
-        App.toast('Audio uploaded to library!', 'success');
+        try {
+          await CloudSync.saveKey('customAudioTracks', customTracks);
+          App.toast(CloudSync.isGoogleUser ? 'Song saved and synced to your Google account.' : 'Song saved on this device. Login Google to sync between devices.', 'success');
+        } catch (syncErr) {
+          App.toast('Song saved locally, but cloud sync failed. Check your connection and retry sync.', 'error');
+        }
         if (App.currentView === 'music') App.renderCurrentView();
+      },
+
+      async deleteUploadedSong(trackId) {
+        const track = this.tracks.find(t => t.id === trackId);
+        if (!track || !track.id.startsWith('audio_')) return;
+        const customTracks = ((await LocalDB.getState('customAudioTracks')) || []).filter(t => t.id !== trackId);
+        await LocalDB.setState('customAudioTracks', customTracks);
+        await LocalDB.deleteAudioBlob(trackId);
+        this.tracks = this.tracks.filter(t => t.id !== trackId);
+        if (CloudSync.isGoogleUser && CloudSync.storage && CloudSync.user && track.cloudPath) {
+          try { await deleteObject(storageRef(CloudSync.storage, track.cloudPath)); } catch (e) { console.warn('Cloud audio deletion failed', e); }
+        }
+        try { await CloudSync.saveKey('customAudioTracks', customTracks); } catch { App.toast('Song removed locally; cloud update failed.', 'error'); }
+        if (this.currentIndex >= this.tracks.length) this.currentIndex = Math.max(0, this.tracks.length - 1);
+        App.toast('Uploaded song deleted.', 'success');
+        App.renderCurrentView();
       },
 
       formatTime(sec) {
@@ -2017,7 +2056,7 @@
       updateProgressUI() {
         const track = this.getCurrentTrack();
         if (!track) return;
-        const dur = track.isBuiltin ? track.duration : (track.source === 'youtube' ? (YouTubePlayerAPI.player?.getDuration?.() || track.duration || 0) : (this.audioEl.duration || track.duration || 0));
+        const dur = track.isBuiltin ? track.duration : (this.audioEl.duration || track.duration || 0);
         const pct = dur ? Math.min(100, Math.round((this.progressSec / dur) * 100)) : 0;
 
         ['mini', 'full'].forEach((prefix) => {
@@ -2053,7 +2092,6 @@
         if (window.lucide) lucide.createIcons();
       }
     };
-
     // =========================================================================
     // MODULE 7: FOCUS TIMER ENGINE (services/focusEngine.js)
     // =========================================================================
@@ -2286,8 +2324,13 @@
             avgSpeedKmh,
             coords: this.coords
           });
-          await Store.save('gpsActivities');
-          App.toast(`Saved ${this.activityType} (${this.distanceKm.toFixed(2)} km)!`, 'success');
+          try {
+            await Store.save('gpsActivities');
+            App.toast(`Saved ${this.activityType} (${this.distanceKm.toFixed(2)} km)!`, 'success');
+          } catch (saveErr) {
+            App.toast('GPS activity saved locally; cloud sync failed. Retry sync when online.', 'error');
+            console.error('GPS save/sync failed:', saveErr);
+          }
         }
         this.status = 'idle';
         this.elapsedSec = 0;
@@ -3291,10 +3334,10 @@ Respond in ${langName}. Be proactive, concise, structured, and helpful. Use only
       viewVisionBoard() {
         const cards = Store.data.visionBoard || [];
         return `<div class="space-y-4 animate-view"><div class="flex flex-wrap justify-between items-center gap-3"><div><h1 class="text-xl sm:text-2xl font-extrabold">Vision Board</h1><p class="text-xs text-mutedGray">Dreams, goals, and inspiration — saved locally and synced.</p></div><label class="gradient-btn px-4 py-2 rounded-xl text-xs font-bold cursor-pointer"><i data-lucide="plus" class="w-4 h-4 inline"></i> Add image<input type="file" accept="image/*" class="hidden" onchange="App.addVisionImage(this.files[0])"></label></div>
-        <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">${cards.map(c=>`<div class="os-card overflow-hidden"><img src="${c.image}" alt="${this.escapeHTML(c.title)}" class="w-full aspect-[4/3] object-cover"><div class="p-3"><div class="font-bold text-sm">${this.escapeHTML(c.title)}</div><div class="text-xs text-mutedGray mt-1">${this.escapeHTML(c.note||'')}</div><button onclick="App.removeVision('${c.id}')" class="mt-3 px-3 py-1.5 rounded-lg bg-rose-500/10 text-rose-400 text-xs">Remove</button></div></div>`).join('')}</div>${cards.length? '' : '<div class="os-card p-8 text-center text-sm text-mutedGray">Your board is empty. Add photos that remind you what you are working toward.</div>'}</div>`;
+        <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">${cards.map(c=>`<div class="os-card overflow-hidden"><img src="${c.image || c.cloudUrl || ''}" alt="${this.escapeHTML(c.title)}" class="w-full aspect-[4/3] object-cover"><div class="p-3"><div class="font-bold text-sm">${this.escapeHTML(c.title)}</div><div class="text-xs text-mutedGray mt-1">${this.escapeHTML(c.note||'')}</div><button onclick="App.removeVision('${c.id}')" class="mt-3 px-3 py-1.5 rounded-lg bg-rose-500/10 text-rose-400 text-xs">Remove</button></div></div>`).join('')}</div>${cards.length? '' : '<div class="os-card p-8 text-center text-sm text-mutedGray">Your board is empty. Add photos that remind you what you are working toward.</div>'}</div>`;
       },
-      async addVisionImage(file) { if(!file) return; if(!file.type.startsWith('image/')){this.toast('Please select an image.','error');return;} if((Store.data.visionBoard||[]).length>=8){this.toast('Limit reached: 8 images to keep sync manageable.','info');return;} const reader=new FileReader(); reader.onload=async()=>{const im=new Image();im.onload=async()=>{const scale=Math.min(1,900/Math.max(im.width,im.height));const canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.round(im.width*scale));canvas.height=Math.max(1,Math.round(im.height*scale));canvas.getContext('2d').drawImage(im,0,0,canvas.width,canvas.height);const compressed=canvas.toDataURL('image/jpeg',0.62);const title=prompt('Title for this vision?')||file.name;const note=prompt('Short note (optional):')||'';Store.data.visionBoard.unshift({id:'vision_'+Date.now(),title,note,image:compressed,createdAt:Date.now()});await Store.save('visionBoard');this.renderCurrentView();};im.src=reader.result;};reader.readAsDataURL(file); },
-      async removeVision(id){Store.data.visionBoard=Store.data.visionBoard.filter(x=>x.id!==id);await Store.save('visionBoard');this.renderCurrentView();},
+      async addVisionImage(file) { if(!file) return; if(!file.type.startsWith('image/')){this.toast('Please select an image.','error');return;} if((Store.data.visionBoard||[]).length>=8){this.toast('Limit reached: 8 images to keep sync manageable.','info');return;} const reader=new FileReader(); reader.onload=async()=>{const im=new Image();im.onload=async()=>{const scale=Math.min(1,900/Math.max(im.width,im.height));const canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.round(im.width*scale));canvas.height=Math.max(1,Math.round(im.height*scale));canvas.getContext('2d').drawImage(im,0,0,canvas.width,canvas.height);const compressed=canvas.toDataURL('image/jpeg',0.62);const title=prompt('Title for this vision?')||file.name;const note=prompt('Short note (optional):')||'';const id='vision_'+Date.now();let cloudUrl='',cloudPath='';if(CloudSync.isGoogleUser&&CloudSync.storage&&CloudSync.user){try{cloudPath=`users/${CloudSync.user.uid}/visionBoard/${id}.jpg`;const blob=await(await fetch(compressed)).blob();const sr=storageRef(CloudSync.storage,cloudPath);await uploadBytes(sr,blob,{contentType:'image/jpeg'});cloudUrl=await getDownloadURL(sr);}catch(err){cloudPath='';console.warn('Vision image cloud upload failed; local image retained.',err);}}Store.data.visionBoard.unshift({id,title,note,image:compressed,cloudUrl,cloudPath,createdAt:Date.now()});await Store.save('visionBoard');this.renderCurrentView();};im.src=reader.result;};reader.readAsDataURL(file); },
+      async removeVision(id){const card=Store.data.visionBoard.find(x=>x.id===id);if(card?.cloudPath&&CloudSync.storage){try{await deleteObject(storageRef(CloudSync.storage,card.cloudPath));}catch{}}Store.data.visionBoard=Store.data.visionBoard.filter(x=>x.id!==id);await Store.save('visionBoard');this.renderCurrentView();},
       viewFinance(){const f=Store.data.finance||{entries:[],budgets:[],savingsGoals:[],subscriptions:[]};const entries=f.entries||[];const income=entries.filter(e=>e.type==='income').reduce((a,e)=>a+Number(e.amount||0),0);const expense=entries.filter(e=>e.type==='expense').reduce((a,e)=>a+Number(e.amount||0),0);const fmt=n=>new Intl.NumberFormat('id-ID',{style:'currency',currency:'IDR',maximumFractionDigits:0}).format(n);return `<div class="space-y-4 animate-view"><div><h1 class="text-xl sm:text-2xl font-extrabold">Finance & Money</h1><p class="text-xs text-mutedGray">Income, spending, budgets and savings</p></div><div class="grid grid-cols-1 sm:grid-cols-3 gap-3"><div class="os-card p-4"><div class="text-xs text-mutedGray">Income</div><div class="text-lg font-extrabold text-emerald-400">${fmt(income)}</div></div><div class="os-card p-4"><div class="text-xs text-mutedGray">Expenses</div><div class="text-lg font-extrabold text-rose-400">${fmt(expense)}</div></div><div class="os-card p-4"><div class="text-xs text-mutedGray">Balance</div><div class="text-lg font-extrabold">${fmt(income-expense)}</div></div></div><div class="os-card p-4"><h3 class="font-bold text-sm mb-3">Add transaction</h3><div class="grid grid-cols-1 sm:grid-cols-2 gap-2"><select id="fin-type" class="bg-slateDark border border-white/10 rounded-xl p-2 text-xs"><option value="expense">Expense</option><option value="income">Income</option></select><input id="fin-amount" type="number" min="1" placeholder="Amount (IDR)" class="bg-white/5 border border-white/10 rounded-xl p-2 text-xs"><input id="fin-category" placeholder="Category (e.g. food)" class="bg-white/5 border border-white/10 rounded-xl p-2 text-xs"><input id="fin-date" type="date" value="${new Date().toISOString().slice(0,10)}" class="bg-white/5 border border-white/10 rounded-xl p-2 text-xs"><input id="fin-note" placeholder="Note" class="bg-white/5 border border-white/10 rounded-xl p-2 text-xs sm:col-span-2"></div><button onclick="App.addFinanceEntry()" class="gradient-btn mt-3 px-4 py-2 rounded-xl text-xs font-bold">Save transaction</button></div><div class="os-card p-4"><h3 class="font-bold text-sm mb-3">Transaction history</h3><div class="space-y-2 max-h-[420px] overflow-y-auto">${entries.slice().sort((a,b)=>(b.date||'').localeCompare(a.date||'')).map(e=>`<div class="flex justify-between gap-3 border-b border-white/5 pb-2 text-xs"><div class="min-w-0"><div class="font-semibold truncate">${this.escapeHTML(e.category||'Other')} · ${this.escapeHTML(e.note||'')}</div><div class="text-mutedGray">${e.date||''}</div></div><div class="flex items-center gap-2 shrink-0 ${e.type==='income'?'text-emerald-400':'text-rose-400'}">${e.type==='income'?'+':'-'}${fmt(e.amount)}<button onclick="App.deleteFinanceEntry('${e.id}')" class="text-mutedGray ml-1">×</button></div></div>`).join('')||'<p class="text-xs text-mutedGray">No transactions yet.</p>'}</div></div></div>`;},
       async addFinanceEntry(){const amount=Number(document.getElementById('fin-amount')?.value);if(!(amount>0)){this.toast('Enter a valid amount.','error');return;}const f=Store.data.finance;f.entries.unshift({id:'fin_'+Date.now(),type:document.getElementById('fin-type').value,amount,category:document.getElementById('fin-category').value.trim()||'Other',date:document.getElementById('fin-date').value,note:document.getElementById('fin-note').value.trim()});await Store.save('finance');this.renderCurrentView();},
       async deleteFinanceEntry(id){Store.data.finance.entries=Store.data.finance.entries.filter(e=>e.id!==id);await Store.save('finance');this.renderCurrentView();},
@@ -4269,9 +4312,11 @@ Respond in ${langName}. Be proactive, concise, structured, and helpful. Use only
             <div class="grid grid-cols-1 lg:grid-cols-12 gap-5">
               <!-- Now Playing Deck -->
               <div class="lg:col-span-5 os-card p-5 sm:p-6 flex flex-col items-center text-center justify-between">
-                <div id="music-artwork" class="w-40 h-40 sm:w-44 sm:h-44 rounded-3xl gradient-btn flex items-center justify-center mb-4 overflow-hidden shadow-lg ${current?.source === 'youtube' ? 'hidden' : ''}">${current?.artworkUrl ? `<img src="${current.artworkUrl}" class="w-full h-full object-cover" alt="Album Art" />` : `<i data-lucide="disc-3" class="w-20 h-20 ${MusicEngine.isPlaying ? 'animate-spin' : ''}" style="animation-duration:6s"></i>`}</div>
-                <div id="youtube-player-shell" class="w-full aspect-video rounded-2xl overflow-hidden mb-4 bg-black ${current?.source === 'youtube' ? '' : 'hidden'}"><div id="youtube-player-mount" class="w-full h-full"></div></div>
-
+                <div class="w-40 h-40 sm:w-44 sm:h-44 rounded-3xl gradient-btn flex items-center justify-center mb-4 overflow-hidden shadow-lg">
+                  ${current?.artworkUrl
+                    ? `<img src="${current.artworkUrl}" class="w-full h-full object-cover" alt="Album Art" />`
+                    : `<i data-lucide="disc-3" class="w-20 h-20 ${MusicEngine.isPlaying ? 'animate-spin' : ''}" style="animation-duration:6s"></i>`}
+                </div>
                 <div class="max-w-full px-2">
                   <h2 class="text-base sm:text-lg font-extrabold truncate">${this.escapeHTML(current?.title || '')}</h2>
                   <p class="text-xs text-mutedGray mt-0.5 truncate">${this.escapeHTML(current?.artist || '')}</p>
@@ -4325,7 +4370,6 @@ Respond in ${langName}. Be proactive, concise, structured, and helpful. Use only
                     <input id="global-music-q" value="${this.escapeHTML(MusicEngine.searchQuery)}" placeholder="${t('searchMusicPlaceholder')}" class="flex-1 bg-white/[0.05] border border-white/10 rounded-xl px-3.5 py-2 text-xs outline-none" />
                     <button type="submit" class="gradient-btn px-4 py-2 rounded-xl text-xs font-semibold">${t('searchBtn')}</button>
                   </form>
-                  <p class="text-[10px] text-mutedGray">Playback menggunakan player YouTube resmi. API key diperlukan untuk pencarian; YouTube tidak bisa diunduh offline di sini.</p>
                   <div class="space-y-2 max-h-96 overflow-y-auto">
                     ${MusicEngine.isSearching
                       ? `<div class="py-10 text-center text-xs theme-primary-text animate-pulse">Searching global catalog...</div>`
@@ -4342,7 +4386,7 @@ Respond in ${langName}. Be proactive, concise, structured, and helpful. Use only
                                 </div>
                               </button>
                               <div class="flex items-center gap-1.5 shrink-0">
-                                ${sr.source === 'youtube' ? `<span class="text-[10px] px-2 py-1 rounded-lg bg-red-500/10 text-red-300">YouTube · play full in player</span>` : isSaved
+                                ${isSaved
                                   ? `<span class="text-[10px] px-2 py-1 rounded-lg bg-emerald-500/15 text-emerald-400 font-semibold">${t('downloadedBadge')}</span>`
                                   : `<button onclick="MusicEngine.downloadForOffline('${sr.id}')" class="px-2.5 py-1.5 rounded-lg bg-white/10 hover:bg-white/15 text-[11px] font-semibold flex items-center gap-1">
                                       <i data-lucide="download" class="w-3.5 h-3.5"></i>
@@ -4399,6 +4443,7 @@ Respond in ${langName}. Be proactive, concise, structured, and helpful. Use only
                           <button onclick="App.toggleFavoriteTrack('${tr.id}')" class="p-1.5 rounded-lg ${isFav ? 'text-rose-500' : 'text-mutedGray hover:text-white'}">
                             <i data-lucide="heart" class="w-4 h-4"></i>
                           </button>
+                          ${tr.id.startsWith('audio_') ? `<button onclick="MusicEngine.deleteUploadedSong('${tr.id}')" title="Delete uploaded song" class="p-1.5 rounded-lg text-mutedGray hover:text-rose-400"><i data-lucide="trash-2" class="w-4 h-4"></i></button>` : ''}
                         </div>`;
                     }).join('')}
                   </div>` : ''}
@@ -5058,7 +5103,7 @@ Respond in ${langName}. Be proactive, concise, structured, and helpful. Use only
                   </div>
                 </div>
                 <div class="pt-4 border-t border-white/10 flex flex-wrap gap-3">
-                  <button onclick="CloudSync.pushAllToCloud(); App.toast('All data synced!', 'success')" class="gradient-btn px-4 py-2 rounded-xl text-xs font-semibold">${t('saveAndSync')}</button>
+                  <button onclick="CloudSync.pushAllToCloud()" class="gradient-btn px-4 py-2 rounded-xl text-xs font-semibold">${t('saveAndSync')}</button>
                   <button onclick="CloudSync.signOutGoogle()" class="px-4 py-2 rounded-xl bg-rose-500/15 text-rose-400 hover:bg-rose-500/25 text-xs font-semibold">${t('signOut')}</button>
                 </div>` : `
                 <div class="space-y-3">
@@ -5169,10 +5214,15 @@ Respond in ${langName}. Be proactive, concise, structured, and helpful. Use only
       openModal(html) {
         const root = document.getElementById('modal-root');
         const card = document.getElementById('modal-card');
-        if (!root || !card) return;
+        if (!root || !card) {
+          console.error('MY DAILY modal host is missing from the page.');
+          this.toast('Form tidak dapat dibuka. Komponen modal tidak ditemukan.', 'error');
+          return;
+        }
         card.innerHTML = html;
         root.classList.remove('hidden');
         root.classList.add('flex');
+        document.body.classList.add('overflow-hidden');
         if (window.lucide) lucide.createIcons();
       },
 
@@ -5181,6 +5231,7 @@ Respond in ${langName}. Be proactive, concise, structured, and helpful. Use only
         if (!root) return;
         root.classList.add('hidden');
         root.classList.remove('flex');
+        document.body.classList.remove('overflow-hidden');
       },
 
       toast(message, type = 'info') {
@@ -5221,6 +5272,10 @@ Respond in ${langName}. Be proactive, concise, structured, and helpful. Use only
     window.GPSEngine = GPSEngine;
     window.AIEngine = AIEngine;
     window.CloudSync = CloudSync;
+
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') App.closeModal();
+    });
 
     window.addEventListener('DOMContentLoaded', () => {
       App.init();
